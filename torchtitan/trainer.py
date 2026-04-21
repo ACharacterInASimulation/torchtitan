@@ -727,19 +727,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Collect all microbatches on CPU and count total valid tokens
         microbatches = []
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+        local_num_samples = torch.tensor(0, dtype=torch.int64)
         for _microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
+            local_num_samples += labels.shape[0]
             microbatches.append((input_dict, labels))
 
         # All-reduce to get global token count across DP ranks
         # Move to GPU for distributed communication
         local_valid_tokens = local_valid_tokens.to(self.device)
+        local_num_samples = local_num_samples.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
             global_valid_tokens = dist_utils.dist_sum(local_valid_tokens, batch_mesh)
+            global_num_samples = dist_utils.dist_sum(local_num_samples, batch_mesh)
         else:
             global_valid_tokens = local_valid_tokens.float()
+            global_num_samples = local_num_samples.float()
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
@@ -757,6 +762,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 global_valid_tokens=global_valid_tokens,
             )
             accumulated_losses.append(loss.detach())
+            self.metrics_processor.update_memory_component_peaks()
 
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
@@ -767,6 +773,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
+        self.metrics_processor.update_memory_component_peaks()
         self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.

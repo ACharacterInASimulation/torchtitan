@@ -88,27 +88,34 @@ def get_peak_flops(device_name: str) -> float:
         device_name = " ".join(filtered_lines) or device_name
     except FileNotFoundError as e:
         logger.warning(f"Error running lspci: {e}, fallback to use device_name")
-    if "A100" in device_name:
+    device_name_lower = device_name.lower()
+
+    if "a100" in device_name_lower:
         # data from https://www.nvidia.com/en-us/data-center/a100/
         return 312e12
-    elif "A6000" in device_name:
+    elif "rtx 5000" in device_name_lower and "ada" in device_name_lower:
+        # NVIDIA RTX 5000 Ada Generation publishes 65.3 FP32 TFLOPS.
+        # NVIDIA's Ada BF16 dense tensor throughput is approximately 4x FP32
+        # (matching the official L40S BF16 specification), so we infer 261.2 TFLOPS.
+        return 261.2e12
+    elif "a6000" in device_name_lower:
         # data from https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/
         # quadro-product-literature/proviz-print-nvidia-rtx-a6000-datasheet-us-nvidia-1454980-r9-web%20(1).pdf
         # NOTE: 309.7 TFLOPS is with sparsity; dense value is half.
         return 154.85e12
-    elif "H100" in device_name:
+    elif "h100" in device_name_lower:
         # data from https://www.nvidia.com/en-us/data-center/h100/
         # NOTE: Specifications are one-half lower without sparsity.
-        if "NVL" in device_name:
+        if "nvl" in device_name_lower:
             return 835e12
-        elif "PCIe" in device_name:
+        elif "pcie" in device_name_lower:
             return 756e12
         else:  # for H100 SXM and other variants
             return 989e12
-    elif "H200" in device_name:
+    elif "h200" in device_name_lower:
         # data from https://www.nvidia.com/en-us/data-center/h200/
         return 989e12
-    elif "H20" in device_name:
+    elif "h20" in device_name_lower:
         # NVIDIA H20 is a region-specific GPU variant.
         # Since first-hand specifications do not seem to be readily available on
         # NVIDIA's official global website, we refer to technical reports from
@@ -117,27 +124,27 @@ def get_peak_flops(device_name: str) -> float:
         # Ref: https://www.tomshardware.com/news/
         # nvidias-latest-regulation-compliant-gpu-for-china-has-been-delayed-to-early-next-year
         return 148e12
-    elif "GB200" in device_name or "GB300" in device_name:
+    elif "gb200" in device_name_lower or "gb300" in device_name_lower:
         # Grace Blackwell Superchips (Grace CPU + Blackwell GPU)
         # BF16 dense per GPU: 2,500 TFLOPS (half of 5,000 TFLOPS with sparsity)
         # GB200 data from https://www.nvidia.com/en-us/data-center/dgx-gb200
         # GB300 data from https://www.nvidia.com/en-us/data-center/dgx-gb300
         return 2.5e15
-    elif "B300" in device_name or "B200" in device_name:
+    elif "b300" in device_name_lower or "b200" in device_name_lower:
         # data from https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
         # Checked after GB300 to avoid false match on "GB300"
         return 2.25e15
-    elif "MI355X" in device_name:
+    elif "mi355x" in device_name_lower:
         # MI355X data from https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html
         return 2500e12
-    elif "MI300X" in device_name or "MI325X" in device_name:
+    elif "mi300x" in device_name_lower or "mi325x" in device_name_lower:
         # MI300X data from https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html
         # MI325X data from https://www.amd.com/en/products/accelerators/instinct/mi300/mi325x.html
         return 1300e12
-    elif "MI250X" in device_name:
+    elif "mi250x" in device_name_lower:
         # data from https://www.amd.com/en/products/accelerators/instinct/mi200/mi250x.html (per GCD)
         return 191.5e12
-    elif "Data Center GPU Max 1550" in device_name:
+    elif "data center gpu max 1550" in device_name_lower:
         # Also known as Ponte Vecchio (PVC).
         # data from https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2025-0/intel-xe-gpu-architecture.html
         # Dot Product Accumulate Systolic (DPAS):
@@ -147,10 +154,10 @@ def get_peak_flops(device_name: str) -> float:
         # Standard EU mode (i.e. 448 max compute units): 298.2 TFLOPS (BF16)
         max_comp_units = torch.xpu.get_device_properties("xpu").max_compute_units
         return 512 * max_comp_units * 1300 * 10**6
-    elif "l40s" in device_name:
+    elif "l40s" in device_name_lower:
         # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
         return 362e12
-    elif "neuron" in device_name:
+    elif "neuron" in device_name_lower:
         # AWS Trainium/Inferentia: query chip type via torch.neuron
         # TensorEngine BF16 TFLOPS per NeuronCore × default Logical NeuronCore (LNC) count per device
         neuron_device_name = device_module.get_device_properties().name

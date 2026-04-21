@@ -36,6 +36,142 @@ DeviceMemStats = namedtuple(
 )
 
 
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:  # pragma: no cover - older torch builds
+    DTensor = None
+
+
+def _unwrap_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if DTensor is not None and isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+
+def _storage_nbytes(tensor: torch.Tensor) -> int:
+    try:
+        return tensor.untyped_storage().nbytes()
+    except RuntimeError:
+        return tensor.numel() * tensor.element_size()
+
+
+def _tensor_storage_key(
+    tensor: torch.Tensor, device: torch.device
+) -> tuple[int | None, int, int] | None:
+    tensor = _unwrap_local_tensor(tensor)
+    if tensor.device.type != device.type:
+        return None
+    if device.index is not None and tensor.device.index != device.index:
+        return None
+
+    storage_nbytes = _storage_nbytes(tensor)
+    if storage_nbytes <= 0:
+        return None
+
+    return (
+        tensor.device.index,
+        tensor.untyped_storage().data_ptr(),
+        storage_nbytes,
+    )
+
+
+def _tensor_collection_bytes(
+    tensors: list[torch.Tensor | None],
+    *,
+    device: torch.device,
+) -> int:
+    seen: set[tuple[int | None, int, int]] = set()
+    total_bytes = 0
+    for tensor in tensors:
+        if tensor is None:
+            continue
+        key = _tensor_storage_key(tensor, device)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        total_bytes += key[2]
+    return total_bytes
+
+
+class MemoryComponentTracker:
+    """Tracks persistent memory components and an activation peak estimate.
+
+    We can measure local parameter, gradient, and optimizer-state memory exactly
+    from live tensors on the current rank. Activation memory is estimated from
+    the allocator's peak active bytes minus those persistent components.
+    """
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.grad_peak_bytes = 0
+
+    def update_grad_peak(self, model_parts: list[torch.nn.Module] | None) -> None:
+        if not model_parts:
+            return
+        grad_bytes = _tensor_collection_bytes(
+            [p.grad for model in model_parts for p in model.parameters()],
+            device=self.device,
+        )
+        self.grad_peak_bytes = max(self.grad_peak_bytes, grad_bytes)
+
+    def build_metrics(
+        self,
+        *,
+        model_parts: list[torch.nn.Module] | None,
+        optimizers: OptimizersContainer | None,
+        device_memory_monitor: "DeviceMemoryMonitor",
+    ) -> dict[str, float]:
+        if not model_parts:
+            return {}
+
+        weight_bytes = _tensor_collection_bytes(
+            [p for model in model_parts for p in model.parameters()],
+            device=self.device,
+        )
+
+        optimizer_tensors: list[torch.Tensor] = []
+        if optimizers is not None:
+            for optimizer in optimizers.optimizers:
+                for state in optimizer.state.values():
+                    for value in state.values():
+                        if isinstance(value, torch.Tensor):
+                            optimizer_tensors.append(value)
+        optimizer_bytes = _tensor_collection_bytes(
+            optimizer_tensors,
+            device=self.device,
+        )
+
+        peak_active_bytes = device_module.memory_stats(device_memory_monitor.device).get(
+            "active_bytes.all.peak", -1
+        )
+        activation_peak_bytes = max(
+            0,
+            peak_active_bytes - weight_bytes - optimizer_bytes - self.grad_peak_bytes,
+        )
+
+        return {
+            "memory/weights(GiB)": device_memory_monitor._to_gib(weight_bytes),
+            "memory/weights(%)": device_memory_monitor._to_pct(weight_bytes),
+            "memory/activations_peak_estimated(GiB)": device_memory_monitor._to_gib(
+                activation_peak_bytes
+            ),
+            "memory/activations_peak_estimated(%)": device_memory_monitor._to_pct(
+                activation_peak_bytes
+            ),
+            "memory/gradients_peak(GiB)": device_memory_monitor._to_gib(
+                self.grad_peak_bytes
+            ),
+            "memory/gradients_peak(%)": device_memory_monitor._to_pct(
+                self.grad_peak_bytes
+            ),
+            "memory/optimizer(GiB)": device_memory_monitor._to_gib(optimizer_bytes),
+            "memory/optimizer(%)": device_memory_monitor._to_pct(optimizer_bytes),
+        }
+
+    def reset_peak_stats(self) -> None:
+        self.grad_peak_bytes = 0
+
+
 class DeviceMemoryMonitor:
     def __init__(self, device: str = f"{device_type}:0"):
         # pyrefly: ignore [read-only]
@@ -310,12 +446,14 @@ class MetricsProcessor(Configurable):
     ntokens_since_last_log: int
     data_loading_times: list[float]
     time_last_log: float
+    previous_global_avg_loss: float | None
 
     num_flops_per_token: int
     has_quantization: bool
     optimizers: OptimizersContainer | None
     lr_schedulers: LRSchedulersContainer | None
     model_parts: list[torch.nn.Module] | None
+    memory_component_tracker: MemoryComponentTracker
 
     def __init__(
         self,
@@ -352,15 +490,22 @@ class MetricsProcessor(Configurable):
         self.ntokens_since_last_log = 0
         self.data_loading_times = []
         self.time_last_log = time.perf_counter()
+        self.previous_global_avg_loss = None
         self.device_memory_monitor.reset_peak_stats()
 
         self.has_quantization = has_quantization
+        self.memory_component_tracker = MemoryComponentTracker(
+            self.device_memory_monitor.device
+        )
 
         # These variables have to be set later as they depend on other components or model.
         self.num_flops_per_token = -1
         self.optimizers = None
         self.lr_schedulers = None
         self.model_parts = None
+
+    def update_memory_component_peaks(self) -> None:
+        self.memory_component_tracker.update_grad_peak(self.model_parts)
 
     def should_log(self, step: int) -> bool:
         return step == 1 or step % self.config.log_freq == 0
@@ -491,6 +636,15 @@ class MetricsProcessor(Configurable):
         else:
             mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
 
+        stat_efficiency = None
+        if self.previous_global_avg_loss is not None:
+            stat_efficiency = abs(global_avg_loss - self.previous_global_avg_loss) / max(
+                1, self.ntokens_since_last_log
+            )
+        goodput = None
+        if stat_efficiency is not None:
+            goodput = tps * stat_efficiency
+
         time_end_to_end = time_delta / self.config.log_freq
         time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
         time_data_loading_pct = 100 * sum(self.data_loading_times) / time_delta
@@ -513,8 +667,19 @@ class MetricsProcessor(Configurable):
             "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
             "memory/num_ooms": device_mem_stats.num_ooms,
         }
+        metrics.update(
+            self.memory_component_tracker.build_metrics(
+                model_parts=self.model_parts,
+                optimizers=self.optimizers,
+                device_memory_monitor=self.device_memory_monitor,
+            )
+        )
         if mfu is not None:
             metrics["mfu(%)"] = mfu
+        if stat_efficiency is not None:
+            metrics["stat_efficiency"] = stat_efficiency
+        if goodput is not None:
+            metrics["goodput"] = goodput
 
         if extra_metrics:
             metrics.update(extra_metrics)
@@ -523,6 +688,31 @@ class MetricsProcessor(Configurable):
 
         color = self.color
         mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
+        stat_efficiency_str = (
+            f"{stat_efficiency:.6f}" if stat_efficiency is not None else "N/A"
+        )
+        goodput_str = f"{goodput:,.3f}" if goodput is not None else "N/A"
+        weights_gib = metrics.get("memory/weights(GiB)")
+        activations_peak_gib = metrics.get("memory/activations_peak_estimated(GiB)")
+        gradients_peak_gib = metrics.get("memory/gradients_peak(GiB)")
+        optimizer_gib = metrics.get("memory/optimizer(GiB)")
+        memory_breakdown_str = ""
+        if all(
+            value is not None
+            for value in (
+                weights_gib,
+                activations_peak_gib,
+                gradients_peak_gib,
+                optimizer_gib,
+            )
+        ):
+            memory_breakdown_str = (
+                f"  {color.turquoise}w/act/g/opt: "
+                f"{weights_gib:4.2f}/"
+                f"{activations_peak_gib:4.2f}/"
+                f"{gradients_peak_gib:4.2f}/"
+                f"{optimizer_gib:4.2f}GiB"
+            )
         logger.info(
             f"{color.red}step: {step:2}  "
             f"{color.green}loss: {global_avg_loss:8.5f}  "
@@ -531,12 +721,17 @@ class MetricsProcessor(Configurable):
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
-            f"{color.magenta}mfu: {mfu_str}{color.reset}"
+            f"{color.magenta}mfu: {mfu_str}  "
+            f"{color.yellow}stat_eff: {stat_efficiency_str}  "
+            f"{color.white}goodput: {goodput_str}"
+            f"{memory_breakdown_str}{color.reset}"
         )
 
         self.ntokens_since_last_log = 0
         self.data_loading_times.clear()
         self.time_last_log = time.perf_counter()
+        self.previous_global_avg_loss = float(global_avg_loss)
+        self.memory_component_tracker.reset_peak_stats()
         self.device_memory_monitor.reset_peak_stats()
 
     def log_validation(
@@ -559,7 +754,6 @@ class MetricsProcessor(Configurable):
             "validation_metrics/memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
             "validation_metrics/memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
         }
-
         if extra_metrics:
             metrics.update(extra_metrics)
 
@@ -576,6 +770,7 @@ class MetricsProcessor(Configurable):
 
         self.ntokens_since_last_log = 0
         self.time_last_log = time.perf_counter()
+        self.memory_component_tracker.reset_peak_stats()
         self.device_memory_monitor.reset_peak_stats()
 
     def close(self):
